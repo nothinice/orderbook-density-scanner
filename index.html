@@ -586,15 +586,41 @@ function bindAutoSave() {
 
         // Пропущенные тикеры (чтобы было видно, почему некоторые пары не попали в результат)
         let skipped = []; // { symbol, reason }
+        let abortInfo = null; // { reason, untilMs }
 
         function sleep(ms) {
             return new Promise(resolve => setTimeout(resolve, ms));
         }
 
-        async function fetchJsonWithRetry(url, retries = 2, backoffMs = 250) {
+        function createRateLimitState({ minIntervalMs = 0 } = {}) {
+            return {
+                minIntervalMs,
+                nextAllowedAt: 0,
+                lastRequestAt: 0,
+                queue: Promise.resolve()
+            };
+        }
+
+        async function rateLimitWait(state) {
+            if (!state) return;
+            state.queue = state.queue.then(async () => {
+                const now = Date.now();
+                const waitUntil = Math.max(
+                    state.nextAllowedAt || 0,
+                    (state.lastRequestAt || 0) + (state.minIntervalMs || 0)
+                );
+                const waitMs = Math.max(0, waitUntil - now);
+                if (waitMs) await sleep(waitMs);
+                state.lastRequestAt = Date.now();
+            });
+            await state.queue;
+        }
+
+        async function fetchJsonWithRetry(url, retries = 2, backoffMs = 250, options = {}) {
             let lastErr = null;
             for (let attempt = 0; attempt <= retries; attempt++) {
                 try {
+                    await rateLimitWait(options.rateLimitState);
                     const resp = await fetch(url);
                     if (!resp.ok) {
                         const txt = await resp.text().catch(() => '');
@@ -603,14 +629,27 @@ function bindAutoSave() {
                         err.status = resp.status;
                         const ra = resp.headers ? resp.headers.get("Retry-After") : null;
                         err.retryAfterMs = ra ? (parseFloat(ra) * 1000) : null;
-// Повторяем только на лимитах и временных ошибках
-                        if (resp.status === 429 || resp.status >= 500) throw err;
-                        return { ok: false, error: err.message };
+                        const banMatch = txt.match(/banned until (\d+)/i);
+                        err.banUntilMs = banMatch ? Number(banMatch[1]) : null;
+                        // Повторяем только на лимитах и временных ошибках
+                        if (resp.status === 429 || resp.status === 418 || resp.status >= 500) throw err;
+                        return { ok: false, error: err.message, errorObj: err };
                     }
                     const data = await resp.json();
                     return { ok: true, data };
                 } catch (e) {
                     lastErr = e;
+                    if (options.rateLimitState) {
+                        const now = Date.now();
+                        if (e && e.retryAfterMs && isFinite(e.retryAfterMs)) {
+                            options.rateLimitState.nextAllowedAt = Math.max(options.rateLimitState.nextAllowedAt || 0, now + e.retryAfterMs);
+                        }
+                        if (e && e.banUntilMs && isFinite(e.banUntilMs)) {
+                            options.rateLimitState.nextAllowedAt = Math.max(options.rateLimitState.nextAllowedAt || 0, e.banUntilMs);
+                            if (typeof options.onBan === 'function') options.onBan(e);
+                            break;
+                        }
+                    }
                     if (attempt < retries) {
                         {
                         let delay = backoffMs * Math.pow(2, attempt);
@@ -620,6 +659,9 @@ function bindAutoSave() {
                             delay = Math.max(delay, 800 * Math.pow(2, attempt));
                             if (e.retryAfterMs && isFinite(e.retryAfterMs)) delay = Math.max(delay, e.retryAfterMs);
                         }
+                        if (status === 418) {
+                            delay = Math.max(delay, 1500 * Math.pow(2, attempt));
+                        }
                         // Jitter +/- 30%
                         const jitter = delay * (0.15 + Math.random() * 0.15);
                         await sleep(delay + jitter);
@@ -628,7 +670,7 @@ function bindAutoSave() {
                     }
                 }
             }
-            return { ok: false, error: lastErr ? String(lastErr.message || lastErr) : 'Unknown error' };
+            return { ok: false, error: lastErr ? String(lastErr.message || lastErr) : 'Unknown error', errorObj: lastErr };
         }
 
         
@@ -766,6 +808,7 @@ function initializeGroupsUI() {
             
             allData = {};
             skipped = [];
+            abortInfo = null;
             Object.keys(LIQUIDITY_GROUPS).forEach(id => allData[id] = []);
 
             const maxConcurrent = Math.max(1, Math.min(50, parseInt(opts.maxConcurrent) || 5));
@@ -783,6 +826,7 @@ function initializeGroupsUI() {
 
             const worker = async () => {
                 while (true) {
+                    if (abortInfo) return;
                     const myIndex = idx++;
                     if (myIndex >= total) return;
                     const symbol = symbols[myIndex];
@@ -828,6 +872,17 @@ function initializeGroupsUI() {
                             coverageOk: (cov.downPct >= percentage && cov.upPct >= percentage)
                         });
                     } catch (e) {
+                        if (e && (e.status === 418 || e.banUntilMs)) {
+                            const untilMs = e.banUntilMs && isFinite(e.banUntilMs) ? e.banUntilMs : null;
+                            const untilText = untilMs ? new Date(untilMs).toLocaleString('ru-RU') : 'неизвестно';
+                            abortInfo = {
+                                reason: `🚫 Binance временно заблокировал запросы (HTTP 418). Бан до: ${untilText}. Рекомендуется снизить параллельность до 1–2, увеличить задержку и/или использовать WebSocket.`,
+                                untilMs
+                            };
+                            skipped.push({ symbol, reason: abortInfo.reason });
+                            updateProgressUI();
+                            return;
+                        }
                         const msg = String(e?.message || e);
                         skipped.push({ symbol, reason: msg });
                     } finally {
@@ -845,6 +900,8 @@ function initializeGroupsUI() {
 
         }
 
+        const binanceRateLimitState = createRateLimitState({ minIntervalMs: 150 });
+
         const EXCHANGES = {
     binance: {
         key: 'binance',
@@ -853,7 +910,7 @@ function initializeGroupsUI() {
         _tradingSymbols: null,
         async _ensureExchangeInfo() {
             if (this._tradingSymbols) return this._tradingSymbols;
-            const r = await fetchJsonWithRetry(`https://fapi.binance.com/fapi/v1/exchangeInfo`);
+            const r = await fetchJsonWithRetry(`https://fapi.binance.com/fapi/v1/exchangeInfo`, 2, 250, { rateLimitState: binanceRateLimitState });
             if (!r.ok) {
                 // If exchangeInfo fails, continue without whitelist
                 this._tradingSymbols = null;
@@ -870,8 +927,8 @@ function initializeGroupsUI() {
         async getPrice(symbol) {
             const wl = await this._ensureExchangeInfo();
             if (wl && !wl.has(symbol)) throw new Error(`Symbol not TRADING on Binance Futures: ${symbol}`);
-            const r = await fetchJsonWithRetry(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`);
-            if (!r.ok) throw new Error(r.error || 'ticker error');
+            const r = await fetchJsonWithRetry(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`, 2, 250, { rateLimitState: binanceRateLimitState });
+            if (!r.ok) throw (r.errorObj || new Error(r.error || 'ticker error'));
             const data = r.data;
             const p = parseFloat(data?.lastPrice);
             if (!isFinite(p)) throw new Error('Invalid lastPrice');
@@ -880,8 +937,13 @@ function initializeGroupsUI() {
         async getOrderBook(symbol, limit) {
             const wl = await this._ensureExchangeInfo();
             if (wl && !wl.has(symbol)) throw new Error(`Symbol not TRADING on Binance Futures: ${symbol}`);
-            const r = await fetchJsonWithRetry(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${limit}`);
-            if (!r.ok) throw new Error(r.error || 'depth error');
+            const r = await fetchJsonWithRetry(
+                `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=${limit}`,
+                2,
+                250,
+                { rateLimitState: binanceRateLimitState }
+            );
+            if (!r.ok) throw (r.errorObj || new Error(r.error || 'depth error'));
             const data = r.data;
             const bids = data?.bids || [];
             const asks = data?.asks || [];
@@ -895,7 +957,7 @@ function initializeGroupsUI() {
         maxDepth: 200,
         async getPrice(symbol) {
             const r = await fetchJsonWithRetry(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
-            if (!r.ok) throw new Error(r.error || 'bybit tickers error');
+            if (!r.ok) throw (r.errorObj || new Error(r.error || 'bybit tickers error'));
             const data = r.data;
             if (data?.retCode && data.retCode !== 0) throw new Error(`Bybit retCode ${data.retCode}: ${data.retMsg || 'error'}`);
             const item = data?.result?.list?.[0];
@@ -905,7 +967,7 @@ function initializeGroupsUI() {
         },
         async getOrderBook(symbol, limit) {
             const r = await fetchJsonWithRetry(`https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${symbol}&limit=${limit}`);
-            if (!r.ok) throw new Error(r.error || 'bybit orderbook error');
+            if (!r.ok) throw (r.errorObj || new Error(r.error || 'bybit orderbook error'));
             const data = r.data;
             if (data?.retCode && data.retCode !== 0) throw new Error(`Bybit retCode ${data.retCode}: ${data.retMsg || 'error'}`);
             const res = data?.result;
@@ -1033,6 +1095,20 @@ function getCurrentExchange() {
         function displayResults(percentage) {
             const resultsDiv = document.getElementById('results');
             let html = '';
+
+            if (abortInfo && abortInfo.reason) {
+                html += `
+                    <div class="group-results" style="border-left-color:#ff6b6b;">
+                        <div class="group-title">
+                            <span>🚫 Прервано из-за лимитов</span>
+                            <span class="group-count">требуется пауза</span>
+                        </div>
+                        <div class="group-content" style="color:#b91c1c; font-weight:600;">
+                            ${abortInfo.reason}
+                        </div>
+                    </div>
+                `;
+            }
             
             let totalSymbols = 0;
             Object.values(allData).forEach(group => {
