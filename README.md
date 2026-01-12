@@ -95,7 +95,7 @@ https://nothinice.github.io/orderbook-density-scanner/
 ## Примеры
 
 ### Основной экран
-![Main](screenshots/main.png)
+main.png
 
 ### Coverage (ограничение глубины стакана)
-![Coverage](screenshots/coverage.png)
+coverage.png
