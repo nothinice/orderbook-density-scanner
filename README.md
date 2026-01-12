@@ -91,3 +91,11 @@ https://nothinice.github.io/orderbook-density-scanner/
 - защищённых уровней
 - зон манипуляций
 - реальной глубины рынка
+
+## Примеры
+
+### Основной экран
+![Main](screenshots/main.png)
+
+### Coverage (ограничение глубины стакана)
+![Coverage](screenshots/coverage.png)
